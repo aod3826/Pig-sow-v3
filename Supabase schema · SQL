@@ -1,0 +1,682 @@
+-- ============================================================
+--  🐷  Smart Sow Management — Supabase / PostgreSQL Schema
+--  ฟาร์มนิพนธ์ | รองรับ 200 ตัว + 3 คนงาน
+--  Version: 1.0  |  Engine: PostgreSQL 15 (Supabase)
+-- ============================================================
+
+-- ┌─────────────────────────────────────────────────────────┐
+-- │  EXTENSION                                              │
+-- └─────────────────────────────────────────────────────────┘
+CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
+CREATE EXTENSION IF NOT EXISTS "pg_cron";         -- สำหรับ scheduled alerts (เปิดใน Supabase Dashboard)
+
+
+-- ============================================================
+-- TABLE 1 ── farms  (ข้อมูลฟาร์ม)
+-- ============================================================
+CREATE TABLE farms (
+    id          UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    name        TEXT        NOT NULL,              -- ชื่อฟาร์ม
+    owner_name  TEXT,
+    address     TEXT,
+    phone       TEXT,
+    line_token  TEXT,                              -- LINE Notify Token (แจ้งเตือน)
+    telegram_chat_id TEXT,                         -- Telegram Chat ID
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+COMMENT ON TABLE farms IS 'ข้อมูลฟาร์ม (1 ฟาร์มต่อ deployment)';
+
+
+-- ============================================================
+-- TABLE 2 ── workers  (คนงาน — เชื่อมกับ Supabase Auth)
+-- ============================================================
+CREATE TABLE workers (
+    id          UUID PRIMARY KEY REFERENCES auth.users(id) ON DELETE CASCADE,
+    farm_id     UUID NOT NULL REFERENCES farms(id),
+    full_name   TEXT NOT NULL,
+    nickname    TEXT,
+    role        TEXT NOT NULL DEFAULT 'staff'
+                    CHECK (role IN ('owner','manager','staff')),
+    phone       TEXT,
+    line_user_id TEXT,
+    telegram_user_id TEXT,
+    is_active   BOOLEAN NOT NULL DEFAULT TRUE,
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+COMMENT ON TABLE workers IS 'คนงานในฟาร์ม เชื่อมกับ Supabase Auth ผ่าน id';
+COMMENT ON COLUMN workers.role IS 'owner=เจ้าของ, manager=ผู้จัดการ, staff=คนงานทั่วไป';
+
+
+-- ============================================================
+-- TABLE 3 ── pens  (คอก)
+-- ============================================================
+CREATE TABLE pens (
+    id          UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    farm_id     UUID NOT NULL REFERENCES farms(id),
+    pen_code    TEXT NOT NULL,                     -- รหัสคอก เช่น "A1", "B3"
+    pen_type    TEXT NOT NULL DEFAULT 'gestation'
+                    CHECK (pen_type IN ('mating','gestation','farrowing','nursery','boar')),
+    capacity    INT  NOT NULL DEFAULT 1,           -- จำนวนแม่หมูที่รับได้
+    note        TEXT,
+    is_active   BOOLEAN NOT NULL DEFAULT TRUE,
+    UNIQUE (farm_id, pen_code)
+);
+
+COMMENT ON COLUMN pens.pen_type IS 'mating=ผสม, gestation=ตั้งท้อง, farrowing=คลอด, nursery=เลี้ยงลูก, boar=พ่อพันธุ์';
+
+
+-- ============================================================
+-- TABLE 4 ── boars  (พ่อพันธุ์)
+-- ============================================================
+CREATE TABLE boars (
+    id          UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    farm_id     UUID NOT NULL REFERENCES farms(id),
+    boar_code   TEXT NOT NULL,                     -- รหัสพ่อพันธุ์
+    breed       TEXT,                              -- สายพันธุ์
+    birth_date  DATE,
+    is_active   BOOLEAN NOT NULL DEFAULT TRUE,
+    note        TEXT,
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE (farm_id, boar_code)
+);
+
+
+-- ============================================================
+-- TABLE 5 ── sows  (แม่หมูแต่ละตัว — Master Record)
+-- ============================================================
+CREATE TABLE sows (
+    id              UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    farm_id         UUID NOT NULL REFERENCES farms(id),
+    sow_code        TEXT NOT NULL,                 -- รหัสแม่หมู เช่น "A001"
+    name            TEXT,                          -- ชื่อเล่น (ถ้ามี)
+    breed           TEXT,                          -- สายพันธุ์
+    birth_date      DATE,                          -- วันเกิด
+    ear_tag         TEXT,                          -- หมายเลขป้ายหู
+    rfid            TEXT,                          -- RFID (ถ้ามี)
+    pen_id          UUID REFERENCES pens(id),      -- คอกปัจจุบัน
+    current_status  TEXT NOT NULL DEFAULT 'empty'
+                        CHECK (current_status IN (
+                            'empty',       -- ว่าง/พักแม่
+                            'mated',       -- ผสมแล้ว (รอตรวจสัด)
+                            'heat_check',  -- รอตรวจท้อง (วันที่ 21)
+                            'pregnant',    -- ยืนยันตั้งท้อง
+                            'late_gestation', -- บำรุงระยะท้าย (วันที่ 85+)
+                            'farrowing_ready', -- เตรียมคลอด (วันที่ 108+)
+                            'nursing',     -- เลี้ยงลูก
+                            'weaned',      -- หย่านม (รอผสมรอบใหม่)
+                            'returned_heat',   -- กลับสัด/ไม่ติด
+                            'culled',      -- คัดทิ้ง
+                            'dead'         -- ตาย
+                        )),
+    parity          INT  NOT NULL DEFAULT 0,       -- ครอกที่ (รอบการผลิต)
+    total_born_alive INT NOT NULL DEFAULT 0,       -- ลูกรอดสะสมทุกรอบ
+    total_litters    INT NOT NULL DEFAULT 0,       -- จำนวนครอกสะสม
+    is_active        BOOLEAN NOT NULL DEFAULT TRUE,
+    registered_by    UUID REFERENCES workers(id),
+    note             TEXT,
+    created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE (farm_id, sow_code)
+);
+
+CREATE INDEX idx_sows_farm_status ON sows(farm_id, current_status);
+CREATE INDEX idx_sows_farm_active ON sows(farm_id, is_active);
+
+COMMENT ON TABLE sows IS 'แม่หมูแต่ละตัว — Master record (ไม่ลบ ใช้ is_active แทน)';
+COMMENT ON COLUMN sows.parity IS 'ครอกที่ (จำนวนรอบที่ผสมสำเร็จ) อัปเดตเมื่อคลอด';
+
+
+-- ============================================================
+-- TABLE 6 ── breeding_cycles  (รอบการผสมพันธุ์แต่ละรอบ ★ หัวใจหลัก)
+-- ============================================================
+CREATE TABLE breeding_cycles (
+    id              UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    sow_id          UUID NOT NULL REFERENCES sows(id),
+    farm_id         UUID NOT NULL REFERENCES farms(id),
+    cycle_number    INT  NOT NULL,                 -- รอบที่ของแม่หมูตัวนี้ (1,2,3,...)
+    status          TEXT NOT NULL DEFAULT 'active'
+                        CHECK (status IN ('active','completed','failed','culled')),
+
+    -- ─── วันที่ผสมพันธุ์ ──────────────────────────────────
+    mating_date     DATE NOT NULL,                 -- D0: วันผสม
+    boar_id         UUID REFERENCES boars(id),     -- พ่อพันธุ์ที่ใช้
+    mating_method   TEXT DEFAULT 'natural'
+                        CHECK (mating_method IN ('natural','ai')),  -- ai = ผสมเทียม
+    mated_by        UUID REFERENCES workers(id),   -- คนงานที่ผสม
+
+    -- ─── วันที่คำนวณอัตโนมัติ (Milestones) ─────────────────
+    due_heat_check_date   DATE GENERATED ALWAYS AS (mating_date + 21) STORED,  -- D21
+    due_ultrasound_date   DATE GENERATED ALWAYS AS (mating_date + 30) STORED,  -- D30
+    due_nutrition_date    DATE GENERATED ALWAYS AS (mating_date + 85) STORED,  -- D85
+    due_farrowing_move    DATE GENERATED ALWAYS AS (mating_date + 108) STORED, -- D108
+    due_farrowing_date    DATE GENERATED ALWAYS AS (mating_date + 114) STORED, -- D114
+
+    -- ─── ผลการตรวจสัด D21 ────────────────────────────────
+    heat_check_date DATE,                          -- วันที่ตรวจจริง
+    heat_check_result TEXT
+                        CHECK (heat_check_result IN ('no_return','returned','skip')),
+    heat_checked_by  UUID REFERENCES workers(id),
+    heat_check_note  TEXT,
+
+    -- ─── ผลอัลตราซาวด์ D30 ───────────────────────────────
+    ultrasound_date  DATE,
+    ultrasound_result TEXT
+                        CHECK (ultrasound_result IN ('confirmed','negative','repeat')),
+    embryo_count     INT,                          -- จำนวนตัวอ่อน (ถ้าทำได้)
+    ultrasound_by    UUID REFERENCES workers(id),
+    ultrasound_note  TEXT,
+
+    -- ─── บำรุงอาหาร D85 ──────────────────────────────────
+    nutrition_started_date DATE,
+    nutrition_noted_by     UUID REFERENCES workers(id),
+
+    -- ─── ย้ายคอกคลอด D108 ────────────────────────────────
+    farrowing_pen_id  UUID REFERENCES pens(id),
+    moved_to_farrowing_date DATE,
+    moved_by          UUID REFERENCES workers(id),
+
+    -- ─── วันคลอดจริง ─────────────────────────────────────
+    actual_farrowing_date  DATE,
+    born_alive             INT  DEFAULT 0,
+    born_dead              INT  DEFAULT 0,
+    mummified              INT  DEFAULT 0,
+    birth_weight_avg_kg    NUMERIC(4,2),
+    farrowing_ease         TEXT
+                               CHECK (farrowing_ease IN ('easy','assisted','difficult','caesarean')),
+    farrowed_by            UUID REFERENCES workers(id),
+    farrowing_note         TEXT,
+
+    -- ─── การเลี้ยงลูก ────────────────────────────────────
+    due_weaning_date       DATE,                   -- คำนวณ: actual_farrowing_date + 21
+    actual_weaning_date    DATE,
+    weaned_count           INT  DEFAULT 0,
+    avg_weaning_weight_kg  NUMERIC(4,2),
+    weaned_by              UUID REFERENCES workers(id),
+    weaning_note           TEXT,
+
+    -- ─── ผสมรอบใหม่ ──────────────────────────────────────
+    due_rebreeding_date    DATE,                   -- คำนวณ: actual_weaning_date + 5
+
+    -- ─── ผลลัพธ์รอบนี้ ───────────────────────────────────
+    failure_reason  TEXT
+                       CHECK (failure_reason IN (
+                           'returned_heat','abortion','stillbirth_all',
+                           'disease','culled','other'
+                       )),
+    completed_at    TIMESTAMPTZ,
+
+    -- ─── Metadata ────────────────────────────────────────
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+
+    UNIQUE (sow_id, cycle_number)
+);
+
+CREATE INDEX idx_cycles_sow ON breeding_cycles(sow_id);
+CREATE INDEX idx_cycles_farm_status ON breeding_cycles(farm_id, status);
+CREATE INDEX idx_cycles_farrowing ON breeding_cycles(due_farrowing_date) WHERE status = 'active';
+CREATE INDEX idx_cycles_mating_date ON breeding_cycles(mating_date);
+
+COMMENT ON TABLE breeding_cycles IS 'รอบการผสมพันธุ์แต่ละรอบของแม่หมู — เก็บสถิติครบทุกขั้น';
+COMMENT ON COLUMN breeding_cycles.due_weaning_date IS 'ต้องอัปเดต trigger เมื่อ actual_farrowing_date ถูกบันทึก';
+
+
+-- ============================================================
+-- TABLE 7 ── cycle_events  (บันทึกเหตุการณ์/ขั้นตอนทุกขั้น)
+-- ============================================================
+CREATE TABLE cycle_events (
+    id          UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    cycle_id    UUID NOT NULL REFERENCES breeding_cycles(id) ON DELETE CASCADE,
+    sow_id      UUID NOT NULL REFERENCES sows(id),
+    farm_id     UUID NOT NULL REFERENCES farms(id),
+    event_type  TEXT NOT NULL
+                    CHECK (event_type IN (
+                        'mating',
+                        'heat_check',        -- ตรวจสัด D21
+                        'ultrasound',        -- อัลตราซาวด์ D30
+                        'nutrition_start',   -- เริ่มบำรุง D85
+                        'pen_move',          -- ย้ายคอก D108
+                        'farrowing',         -- คลอด D114
+                        'nursing_start',     -- เริ่มเลี้ยงลูก
+                        'weaning',           -- หย่านม
+                        'status_change',     -- เปลี่ยนสถานะ
+                        'note',              -- บันทึกทั่วไป
+                        'health_event',      -- เหตุการณ์สุขภาพ
+                        'failure'            -- รอบล้มเหลว
+                    )),
+    event_date  DATE NOT NULL DEFAULT CURRENT_DATE,
+    result      TEXT,                              -- ผลการดำเนินการ
+    details     JSONB,                             -- ข้อมูลเพิ่มเติม (flexible)
+    performed_by UUID REFERENCES workers(id),
+    note        TEXT,
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX idx_events_cycle ON cycle_events(cycle_id);
+CREATE INDEX idx_events_sow   ON cycle_events(sow_id);
+CREATE INDEX idx_events_farm_date ON cycle_events(farm_id, event_date DESC);
+
+COMMENT ON TABLE cycle_events IS 'บันทึก audit trail ทุกการดำเนินการในแต่ละรอบ';
+
+
+-- ============================================================
+-- TABLE 8 ── alerts  (คิวการแจ้งเตือน — สร้างอัตโนมัติ)
+-- ============================================================
+CREATE TABLE alerts (
+    id              UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    farm_id         UUID NOT NULL REFERENCES farms(id),
+    sow_id          UUID NOT NULL REFERENCES sows(id),
+    cycle_id        UUID NOT NULL REFERENCES breeding_cycles(id) ON DELETE CASCADE,
+    alert_type      TEXT NOT NULL
+                        CHECK (alert_type IN (
+                            'heat_check_due',       -- D21 ตรวจสัด
+                            'ultrasound_due',       -- D30 อัลตราซาวด์
+                            'nutrition_start_due',  -- D85 เพิ่มอาหาร
+                            'farrowing_move_due',   -- D108 ย้ายคอก
+                            'farrowing_due',        -- D114 วันคลอด
+                            'weaning_due',          -- D+21 หย่านม
+                            'rebreeding_due',       -- D+5 ผสมใหม่
+                            'overdue'               -- เกินกำหนด
+                        )),
+    due_date        DATE NOT NULL,                  -- วันที่ควรดำเนินการ
+    alert_status    TEXT NOT NULL DEFAULT 'pending'
+                        CHECK (alert_status IN ('pending','sent','acknowledged','snoozed','done','cancelled')),
+    priority        INT  NOT NULL DEFAULT 2
+                        CHECK (priority BETWEEN 1 AND 3),  -- 1=ด่วนมาก, 2=ปกติ, 3=แจ้งล่วงหน้า
+    sent_at         TIMESTAMPTZ,                    -- ส่งแจ้งเตือนครั้งแรกเมื่อ
+    acknowledged_by UUID REFERENCES workers(id),
+    acknowledged_at TIMESTAMPTZ,
+    snooze_until    DATE,
+    channel         TEXT DEFAULT 'app'
+                        CHECK (channel IN ('app','telegram','line','all')),
+    message_text    TEXT,                           -- ข้อความที่ส่ง
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX idx_alerts_farm_due ON alerts(farm_id, due_date, alert_status);
+CREATE INDEX idx_alerts_pending  ON alerts(due_date) WHERE alert_status = 'pending';
+CREATE INDEX idx_alerts_cycle    ON alerts(cycle_id);
+
+COMMENT ON TABLE alerts IS 'คิวการแจ้งเตือน — สร้างอัตโนมัติเมื่อบันทึกการผสม';
+
+
+-- ============================================================
+-- TABLE 9 ── health_records  (บันทึกสุขภาพ/ยา)
+-- ============================================================
+CREATE TABLE health_records (
+    id              UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    sow_id          UUID NOT NULL REFERENCES sows(id),
+    farm_id         UUID NOT NULL REFERENCES farms(id),
+    cycle_id        UUID REFERENCES breeding_cycles(id),
+    record_date     DATE NOT NULL DEFAULT CURRENT_DATE,
+    record_type     TEXT NOT NULL
+                        CHECK (record_type IN (
+                            'vaccination','treatment','deworming',
+                            'vitamin','observation','injury','death'
+                        )),
+    product_name    TEXT,                          -- ชื่อยา/วัคซีน
+    dosage          TEXT,                          -- ขนาดยา
+    route           TEXT,                          -- วิธีให้ (IM/SC/oral)
+    symptoms        TEXT,
+    diagnosis       TEXT,
+    treatment_result TEXT,
+    cost            NUMERIC(10,2),
+    performed_by    UUID REFERENCES workers(id),
+    vet_name        TEXT,
+    note            TEXT,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX idx_health_sow  ON health_records(sow_id);
+CREATE INDEX idx_health_farm ON health_records(farm_id, record_date DESC);
+
+
+-- ============================================================
+-- VIEW 1 ── v_active_cycles  (วงจรที่กำลังดำเนินการ + วันที่ทั้งหมด)
+-- ============================================================
+CREATE OR REPLACE VIEW v_active_cycles AS
+SELECT
+    bc.id                       AS cycle_id,
+    bc.farm_id,
+    s.sow_code,
+    s.name                      AS sow_name,
+    s.current_status,
+    bc.cycle_number,
+    bc.mating_date,
+    bc.due_heat_check_date,
+    bc.due_ultrasound_date,
+    bc.due_nutrition_date,
+    bc.due_farrowing_move,
+    bc.due_farrowing_date,
+    bc.actual_farrowing_date,
+    bc.due_weaning_date,
+    bc.actual_weaning_date,
+    bc.due_rebreeding_date,
+    -- วันที่เหลือ
+    bc.due_farrowing_date - CURRENT_DATE      AS days_to_farrow,
+    CURRENT_DATE - bc.mating_date             AS days_since_mating,
+    -- สถานะ milestone
+    bc.heat_check_result,
+    bc.ultrasound_result,
+    bc.born_alive,
+    bc.weaned_count,
+    -- คอก
+    p.pen_code,
+    p.pen_type,
+    -- พ่อพันธุ์
+    b.boar_code
+FROM breeding_cycles bc
+JOIN sows s ON s.id = bc.sow_id
+LEFT JOIN pens p ON p.id = s.pen_id
+LEFT JOIN boars b ON b.id = bc.boar_id
+WHERE bc.status = 'active';
+
+COMMENT ON VIEW v_active_cycles IS 'รายการรอบที่กำลังดำเนินการทั้งหมด พร้อมวันที่ครบ';
+
+
+-- ============================================================
+-- VIEW 2 ── v_alerts_today  (แจ้งเตือนวันนี้และที่ค้างอยู่)
+-- ============================================================
+CREATE OR REPLACE VIEW v_alerts_today AS
+SELECT
+    a.id,
+    a.farm_id,
+    a.alert_type,
+    a.due_date,
+    a.priority,
+    a.alert_status,
+    a.channel,
+    s.sow_code,
+    s.name          AS sow_name,
+    s.current_status,
+    bc.mating_date,
+    bc.cycle_number,
+    p.pen_code,
+    -- จำนวนวันที่เกินกำหนด (ถ้าค่าลบ = ยังไม่ถึง)
+    CURRENT_DATE - a.due_date AS days_overdue
+FROM alerts a
+JOIN sows s  ON s.id = a.sow_id
+JOIN breeding_cycles bc ON bc.id = a.cycle_id
+LEFT JOIN pens p ON p.id = s.pen_id
+WHERE a.alert_status IN ('pending','sent','snoozed')
+  AND a.due_date <= CURRENT_DATE + 3         -- แสดงล่วงหน้า 3 วัน
+ORDER BY a.priority, a.due_date;
+
+COMMENT ON VIEW v_alerts_today IS 'แจ้งเตือนที่รอดำเนินการ รวมค้างอยู่ และล่วงหน้า 3 วัน';
+
+
+-- ============================================================
+-- VIEW 3 ── v_sow_history  (ประวัติย้อนหลังทุกรอบ)
+-- ============================================================
+CREATE OR REPLACE VIEW v_sow_history AS
+SELECT
+    s.sow_code,
+    s.name          AS sow_name,
+    s.current_status,
+    s.parity,
+    bc.cycle_number,
+    bc.mating_date,
+    bc.actual_farrowing_date,
+    bc.born_alive,
+    bc.born_dead,
+    bc.weaned_count,
+    bc.actual_weaning_date,
+    bc.status       AS cycle_status,
+    bc.failure_reason,
+    CASE
+        WHEN bc.actual_farrowing_date IS NOT NULL
+        THEN bc.actual_farrowing_date - bc.mating_date
+    END             AS gestation_days,
+    CASE
+        WHEN bc.actual_weaning_date IS NOT NULL AND bc.actual_farrowing_date IS NOT NULL
+        THEN bc.actual_weaning_date - bc.actual_farrowing_date
+    END             AS lactation_days
+FROM sows s
+JOIN breeding_cycles bc ON bc.sow_id = s.id
+ORDER BY s.sow_code, bc.cycle_number DESC;
+
+
+-- ============================================================
+-- VIEW 4 ── v_farm_kpi  (ภาพรวม KPI รายฟาร์ม)
+-- ============================================================
+CREATE OR REPLACE VIEW v_farm_kpi AS
+SELECT
+    farm_id,
+    COUNT(DISTINCT id)                                         AS total_sows,
+    COUNT(DISTINCT id) FILTER (WHERE is_active = TRUE)        AS active_sows,
+    COUNT(DISTINCT id) FILTER (WHERE current_status = 'pregnant')   AS pregnant_count,
+    COUNT(DISTINCT id) FILTER (WHERE current_status IN ('farrowing_ready','late_gestation')) AS near_farrowing,
+    COUNT(DISTINCT id) FILTER (WHERE current_status = 'nursing')    AS nursing_count,
+    COUNT(DISTINCT id) FILTER (WHERE current_status = 'mated')      AS just_mated,
+    COUNT(DISTINCT id) FILTER (WHERE current_status = 'empty')      AS empty_sows,
+    AVG(total_born_alive::FLOAT / NULLIF(total_litters,0))   AS avg_born_alive_per_litter
+FROM sows
+WHERE is_active = TRUE
+GROUP BY farm_id;
+
+
+-- ============================================================
+-- FUNCTION 1 ── create_alerts_for_cycle()  (สร้าง alerts อัตโนมัติ)
+-- ============================================================
+CREATE OR REPLACE FUNCTION create_alerts_for_cycle(p_cycle_id UUID)
+RETURNS VOID
+LANGUAGE plpgsql AS $$
+DECLARE
+    v_cycle breeding_cycles%ROWTYPE;
+BEGIN
+    SELECT * INTO v_cycle FROM breeding_cycles WHERE id = p_cycle_id;
+
+    -- ยกเลิก alerts เก่าของรอบนี้ก่อน (ป้องกันซ้ำ)
+    UPDATE alerts SET alert_status = 'cancelled'
+    WHERE cycle_id = p_cycle_id AND alert_status = 'pending';
+
+    -- D21: ตรวจสัด
+    INSERT INTO alerts (farm_id, sow_id, cycle_id, alert_type, due_date, priority, channel, message_text)
+    VALUES (v_cycle.farm_id, v_cycle.sow_id, p_cycle_id,
+            'heat_check_due', v_cycle.due_heat_check_date, 2, 'all',
+            'ครบ 21 วัน! ตรวจว่าแม่หมูกลับสัดหรือไม่');
+
+    -- D30: อัลตราซาวด์
+    INSERT INTO alerts (farm_id, sow_id, cycle_id, alert_type, due_date, priority, channel, message_text)
+    VALUES (v_cycle.farm_id, v_cycle.sow_id, p_cycle_id,
+            'ultrasound_due', v_cycle.due_ultrasound_date, 2, 'all',
+            'ครบ 30 วัน! ทำ Ultrasound ตรวจท้อง');
+
+    -- D85: บำรุงอาหาร
+    INSERT INTO alerts (farm_id, sow_id, cycle_id, alert_type, due_date, priority, channel, message_text)
+    VALUES (v_cycle.farm_id, v_cycle.sow_id, p_cycle_id,
+            'nutrition_start_due', v_cycle.due_nutrition_date, 3, 'app',
+            'ครบ 85 วัน! เพิ่มปริมาณอาหารระยะท้าย');
+
+    -- D108: ย้ายคอกคลอด
+    INSERT INTO alerts (farm_id, sow_id, cycle_id, alert_type, due_date, priority, channel, message_text)
+    VALUES (v_cycle.farm_id, v_cycle.sow_id, p_cycle_id,
+            'farrowing_move_due', v_cycle.due_farrowing_move, 1, 'all',
+            'ครบ 108 วัน! ย้ายแม่หมูเข้าคอกคลอดเพื่อความสะอาด');
+
+    -- D114: วันคลอด
+    INSERT INTO alerts (farm_id, sow_id, cycle_id, alert_type, due_date, priority, channel, message_text)
+    VALUES (v_cycle.farm_id, v_cycle.sow_id, p_cycle_id,
+            'farrowing_due', v_cycle.due_farrowing_date, 1, 'all',
+            'วันนี้คือวันกำหนดคลอด! กรุณาตรวจสอบและบันทึกผล');
+END;
+$$;
+
+
+-- ============================================================
+-- FUNCTION 2 ── update_weaning_alerts()  (สร้าง alerts หลังคลอด)
+-- ============================================================
+CREATE OR REPLACE FUNCTION update_weaning_alerts()
+RETURNS TRIGGER
+LANGUAGE plpgsql AS $$
+BEGIN
+    IF NEW.actual_farrowing_date IS NOT NULL AND OLD.actual_farrowing_date IS NULL THEN
+        -- อัปเดต due_weaning_date
+        UPDATE breeding_cycles
+        SET due_weaning_date    = NEW.actual_farrowing_date + 21,
+            due_rebreeding_date = NEW.actual_farrowing_date + 21 + 5
+        WHERE id = NEW.id;
+
+        -- สร้าง alert หย่านม
+        INSERT INTO alerts (farm_id, sow_id, cycle_id, alert_type, due_date, priority, channel, message_text)
+        VALUES (NEW.farm_id, NEW.sow_id, NEW.id,
+                'weaning_due', NEW.actual_farrowing_date + 21, 2, 'all',
+                'ลูกหมูอายุ 21 วัน! เตรียมตัวหย่านม');
+
+        -- สร้าง alert ผสมรอบใหม่
+        INSERT INTO alerts (farm_id, sow_id, cycle_id, alert_type, due_date, priority, channel, message_text)
+        VALUES (NEW.farm_id, NEW.sow_id, NEW.id,
+                'rebreeding_due', NEW.actual_farrowing_date + 26, 2, 'all',
+                'หลังหย่านม 5 วัน! แม่หมูพร้อมสำหรับการผสมรอบใหม่');
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER trg_weaning_alerts
+AFTER UPDATE ON breeding_cycles
+FOR EACH ROW EXECUTE FUNCTION update_weaning_alerts();
+
+
+-- ============================================================
+-- FUNCTION 3 ── on_new_cycle()  (Trigger เมื่อบันทึกรอบใหม่)
+-- ============================================================
+CREATE OR REPLACE FUNCTION on_new_cycle()
+RETURNS TRIGGER
+LANGUAGE plpgsql AS $$
+BEGIN
+    -- สร้าง alerts อัตโนมัติสำหรับรอบใหม่
+    PERFORM create_alerts_for_cycle(NEW.id);
+
+    -- บันทึก event
+    INSERT INTO cycle_events (cycle_id, sow_id, farm_id, event_type, event_date, result, details)
+    VALUES (NEW.id, NEW.sow_id, NEW.farm_id, 'mating', NEW.mating_date, 'recorded',
+            jsonb_build_object('boar_id', NEW.boar_id, 'method', NEW.mating_method));
+
+    -- อัปเดตสถานะแม่หมู
+    UPDATE sows
+    SET current_status = 'mated',
+        updated_at     = NOW()
+    WHERE id = NEW.sow_id;
+
+    RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER trg_new_cycle
+AFTER INSERT ON breeding_cycles
+FOR EACH ROW EXECUTE FUNCTION on_new_cycle();
+
+
+-- ============================================================
+-- FUNCTION 4 ── update_sow_status()  (sync สถานะแม่หมูเมื่อ cycle เปลี่ยน)
+-- ============================================================
+CREATE OR REPLACE FUNCTION update_sow_status()
+RETURNS TRIGGER
+LANGUAGE plpgsql AS $$
+BEGIN
+    -- ตรวจสัด D21: กลับสัด
+    IF NEW.heat_check_result = 'returned' AND OLD.heat_check_result IS DISTINCT FROM 'returned' THEN
+        UPDATE sows SET current_status = 'returned_heat', updated_at = NOW() WHERE id = NEW.sow_id;
+    END IF;
+
+    -- ยืนยันตั้งท้อง D30
+    IF NEW.ultrasound_result = 'confirmed' AND OLD.ultrasound_result IS DISTINCT FROM 'confirmed' THEN
+        UPDATE sows SET current_status = 'pregnant', updated_at = NOW() WHERE id = NEW.sow_id;
+    END IF;
+
+    -- คลอด
+    IF NEW.actual_farrowing_date IS NOT NULL AND OLD.actual_farrowing_date IS NULL THEN
+        UPDATE sows SET current_status = 'nursing',
+                        parity = parity + 1,
+                        total_born_alive = total_born_alive + COALESCE(NEW.born_alive, 0),
+                        total_litters = total_litters + 1,
+                        updated_at = NOW()
+        WHERE id = NEW.sow_id;
+        -- บันทึก event
+        INSERT INTO cycle_events (cycle_id, sow_id, farm_id, event_type, event_date, result, details)
+        VALUES (NEW.id, NEW.sow_id, NEW.farm_id, 'farrowing', NEW.actual_farrowing_date,
+                'completed', jsonb_build_object(
+                    'born_alive', NEW.born_alive,
+                    'born_dead', NEW.born_dead,
+                    'mummified', NEW.mummified
+                ));
+    END IF;
+
+    -- หย่านม
+    IF NEW.actual_weaning_date IS NOT NULL AND OLD.actual_weaning_date IS NULL THEN
+        UPDATE sows SET current_status = 'weaned', updated_at = NOW() WHERE id = NEW.sow_id;
+    END IF;
+
+    RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER trg_sow_status
+AFTER UPDATE ON breeding_cycles
+FOR EACH ROW EXECUTE FUNCTION update_sow_status();
+
+
+-- ============================================================
+-- ROW LEVEL SECURITY (RLS) — ป้องกันข้ามฟาร์ม
+-- ============================================================
+ALTER TABLE sows              ENABLE ROW LEVEL SECURITY;
+ALTER TABLE breeding_cycles   ENABLE ROW LEVEL SECURITY;
+ALTER TABLE cycle_events      ENABLE ROW LEVEL SECURITY;
+ALTER TABLE alerts            ENABLE ROW LEVEL SECURITY;
+ALTER TABLE health_records    ENABLE ROW LEVEL SECURITY;
+ALTER TABLE pens              ENABLE ROW LEVEL SECURITY;
+ALTER TABLE boars             ENABLE ROW LEVEL SECURITY;
+
+-- Helper function: ดึง farm_id จาก JWT ของ user ปัจจุบัน
+CREATE OR REPLACE FUNCTION auth_farm_id()
+RETURNS UUID
+LANGUAGE sql STABLE AS $$
+    SELECT farm_id FROM workers WHERE id = auth.uid()
+$$;
+
+-- Policy: แต่ละ worker เห็นแค่ข้อมูลฟาร์มตัวเอง
+CREATE POLICY "farm_isolation" ON sows            USING (farm_id = auth_farm_id());
+CREATE POLICY "farm_isolation" ON breeding_cycles USING (farm_id = auth_farm_id());
+CREATE POLICY "farm_isolation" ON cycle_events    USING (farm_id = auth_farm_id());
+CREATE POLICY "farm_isolation" ON alerts          USING (farm_id = auth_farm_id());
+CREATE POLICY "farm_isolation" ON health_records  USING (farm_id = auth_farm_id());
+CREATE POLICY "farm_isolation" ON pens            USING (farm_id = auth_farm_id());
+CREATE POLICY "farm_isolation" ON boars           USING (farm_id = auth_farm_id());
+
+
+-- ============================================================
+-- SEED DATA — ตัวอย่างข้อมูลเริ่มต้น
+-- ============================================================
+-- (กรุณาแทนที่ UUID ของ farm และ workers ด้วยค่าจริงจาก Supabase Auth)
+-- INSERT INTO farms (name, owner_name, phone)
+-- VALUES ('นิพนธ์ฟาร์ม', 'คุณอ๊อด', '08x-xxx-xxxx');
+
+
+-- ============================================================
+-- SCHEDULED JOB (pg_cron) — ส่งแจ้งเตือนทุกเช้า 06:00
+-- ============================================================
+-- SELECT cron.schedule(
+--   'daily-alert-check',
+--   '0 6 * * *',
+--   $$ UPDATE alerts SET alert_status = 'sent', sent_at = NOW()
+--      WHERE alert_status = 'pending' AND due_date <= CURRENT_DATE $$
+-- );
+
+
+-- ============================================================
+-- SUMMARY ── ตารางทั้งหมด
+-- ============================================================
+-- farms             — ข้อมูลฟาร์ม
+-- workers           — คนงาน (เชื่อม Supabase Auth)
+-- pens              — คอกประเภทต่างๆ
+-- boars             — พ่อพันธุ์
+-- sows              — แม่หมูแต่ละตัว (Master)
+-- breeding_cycles   — รอบการผสมพันธุ์ ★ (หัวใจหลัก)
+-- cycle_events      — Audit log ทุกเหตุการณ์
+-- alerts            — คิวแจ้งเตือนอัตโนมัติ
+-- health_records    — บันทึกสุขภาพ/ยา
+-- ============================================================
